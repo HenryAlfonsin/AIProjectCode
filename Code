@@ -1,0 +1,97 @@
+import os
+import torch
+from PIL import Image
+from io import BytesIO
+from diffusers import AutoPipelineForText2Image
+from transformers import BlipProcessor, BlipForConditionalGeneration, Trainer, TrainingArguments
+from datasets import load_dataset, Dataset
+import gradio as gr
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ----------- Load or create models -----------
+print("Loading Stable Diffusion pipeline...")
+sd_pipeline = AutoPipelineForText2Image.from_pretrained(
+    "stabilityai/sd-turbo",
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32
+).to(device)
+
+print("Loading BLIP captioning model...")
+blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
+
+# ----------- Image + Caption Generation Function -----------
+def generate_image_and_caption(prompt):
+    image = sd_pipeline(prompt, num_inference_steps=4, height=384, width=384).images[0]
+    
+    inputs = blip_processor(images=image, return_tensors="pt").to(device)
+    out = blip_model.generate(**inputs)
+    caption = blip_processor.decode(out[0], skip_special_tokens=True)
+    
+    return image, caption
+
+# ----------- Fine-tuning BLIP Function -----------
+def train_blip_model(file):
+    print("Loading training data...")
+    dataset = Dataset.from_csv(datasets)
+
+    # Load and preprocess
+    def transform(example):
+        image = Image.open(example["image"]).convert("RGB").resize((384, 384))
+        inputs = blip_processor(images=image, text=example["caption"], padding="max_length", return_tensors="pt")
+        inputs["labels"] = inputs["input_ids"]
+        return {
+            "pixel_values": inputs["pixel_values"][0],
+            "input_ids": inputs["input_ids"][0],
+            "attention_mask": inputs["attention_mask"][0],
+            "labels": inputs["labels"][0]
+        }
+
+    dataset = dataset.map(transform)
+
+    args = TrainingArguments(
+        output_dir="./blip-finetuned",
+        per_device_train_batch_size=2,
+        num_train_epochs=1,
+        logging_steps=5,
+        save_strategy="no",
+        report_to="none",
+        remove_unused_columns=False,
+        fp16=torch.cuda.is_available()
+    )
+
+    trainer = Trainer(
+        model=blip_model,
+        args=args,
+        train_dataset=dataset
+    )
+
+    print("Training BLIP on your data...")
+    trainer.train()
+    return "BLIP model fine-tuned successfully!"
+
+# ----------- Gradio UI -----------
+with gr.Blocks() as demo:
+    gr.Markdown("## 🖼️ Text to Image + Caption Generator with Optional Training")
+
+    with gr.Row():
+        prompt_input = gr.Textbox(label="Text Prompt")
+        gen_button = gr.Button("Generate Image + Caption")
+
+    with gr.Row():
+        image_output = gr.Image(label="Generated Image")
+        caption_output = gr.Textbox(label="Generated Caption")
+
+    gen_button.click(generate_image_and_caption, inputs=prompt_input, outputs=[image_output, caption_output])
+
+    gr.Markdown("### 📦 (Optional) Fine-tune BLIP Captioning Model")
+    upload = gr.File(label="Upload CSV (columns: image, caption)")
+    train_button = gr.Button("Fine-tune BLIP")
+    train_output = gr.Textbox(label="Training Log")
+
+    train_button.click(fn=train_blip_model, inputs=upload, outputs=train_output)
+
+# Run
+if __name__ == "__main__":
+    demo.launch()
+
